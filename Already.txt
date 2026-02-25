@@ -2,3 +2,4 @@ ffmpeg.exe
 yt-dlp.exe
 cookies.json
 favorites.json
+mpv-2.dll
