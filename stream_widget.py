@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import requests
 import mpv
 import streamlink
 import webbrowser
@@ -21,19 +22,20 @@ class CleanupThread(QThread):
     def __init__(self, mpv_instance, rec_process=None):
         super().__init__()
         self.mpv = mpv_instance
-        self.rec_process = rec_process 
+        self.rec_pid = None
+        if rec_process and hasattr(rec_process, 'pid'):
+            self.rec_pid = rec_process.pid
+        self.daemon = True # [Fix] 設為守護執行緒，防止程式退出時卡住
+        self.daemon = True # [Fix] 設為守護執行緒，防止程式退出時卡住
 
     def run(self):
-        # 1. 強制清理錄影程序
-        if self.rec_process:
+        # 1. 強制清理錄影程序 (使用預先存下的 PID)
+        if self.rec_pid:
             try:
-                if self.rec_process.poll() is None:
-                    pid = self.rec_process.pid
-                    logging.info(f"Force killing recorder PID: {pid}")
-                    subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                logging.info(f"CleanupThread: Terminating recorder PID {self.rec_pid}")
+                subprocess.run(f"taskkill /F /T /PID {self.rec_pid}", shell=True, capture_output=True)
             except Exception as e:
-                try: self.rec_process.kill()
-                except: pass
+                logging.error(f"Cleanup record process error: {e}")
 
         # 2. 清理 MPV
         if self.mpv:
@@ -54,9 +56,24 @@ class StreamLoader(QThread):
         self.quality = quality_preference
         self._is_running = True
 
+    def _check_yt_fast(self, url):
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            }
+            res = requests.get(url, headers=headers, timeout=10)
+            if '"isLiveNow":true' in res.text or 'hqdefault_live.jpg' in res.text:
+                return True
+            return False
+        except:
+            return False
+
     def run(self):
         # YouTube 專用通道
         if "youtube.com" in self.url or "youtu.be" in self.url:
+            if not self._check_yt_fast(self.url):
+                self.error_occurred.emit("Stream Offline (YouTube Check)")
+                return
             logging.info(f"YouTube detected ({self.url}) -> 啟動 MPV 直連模式")
             self.stream_found.emit(self.url)
             return
@@ -77,13 +94,16 @@ class StreamLoader(QThread):
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             }
             
-            if "sooplive" in self.url or "afreecatv" in self.url:
+            is_soop = "sooplive" in self.url or "afreecatv" in self.url
+            is_twitch = "twitch.tv" in self.url
+
+            if is_soop:
                 headers["Referer"] = "https://www.sooplive.co.kr/"
                 headers["Origin"] = "https://www.sooplive.co.kr"
             
             session.set_option("http-headers", headers)
             
-            if "sooplive" in self.url or "afreecatv" in self.url:
+            if is_soop:
                 cookies = CookieManager.get_cookies_for_streamlink()
                 if cookies:
                     session.http.cookies.update(cookies)
@@ -105,6 +125,9 @@ class StreamLoader(QThread):
                 return
             except Exception as pe:
                 err_str = str(pe).lower()
+                if "404" in err_str and is_twitch:
+                    self.error_occurred.emit("Stream Offline (Twitch 404)")
+                    return
                 fallback_keywords = ["login", "age", "adult", "verification", "19+", "premium"]
                 if any(k in err_str for k in fallback_keywords):
                     self.stream_found.emit(self.url)
@@ -112,7 +135,10 @@ class StreamLoader(QThread):
                 raise pe
 
             if not streams:
-                self.stream_found.emit(self.url)
+                if is_twitch or is_soop:
+                    self.error_occurred.emit("Stream Offline (No streams found)")
+                else:
+                    self.stream_found.emit(self.url)
                 return
 
             if not self._is_running: return
@@ -354,8 +380,13 @@ class StreamWidget(QFrame):
             
             cookie_path = os.path.join(base_path, "cookies.json")
             if os.path.exists(cookie_path):
-                if "sooplive" in self.original_stream_url or "afreecatv" in self.original_stream_url:
+                # 只有 SOOP 和 AfreecaTV 需要注入 Cookie，YouTube 恢復為直連模式以避免讀取失敗
+                if "sooplive.co.kr" in self.original_stream_url or "afreecatv.com" in self.original_stream_url:
                     self.mpv_player['ytdl-raw-options'] = f"cookies={cookie_path}"
+                    logging.info(f"MPV: applied cookies for SOOP/AfreecaTV from {cookie_path}")
+                else:
+                    # YouTube 及其它平台不使用 Cookie
+                    self.mpv_player['ytdl-raw-options'] = ""
             
             @self.mpv_player.property_observer('eof-reached')
             def eof_observer(_name, value):
@@ -375,6 +406,9 @@ class StreamWidget(QFrame):
         if self.stack_widget.currentIndex() == 1: return
         if not self.mpv_player: return
 
+        is_youtube = "youtube.com" in self.original_stream_url or "youtu.be" in self.original_stream_url
+        startup_threshold = 60 if is_youtube else 25 # YouTube 需要更長時間啟動
+
         try:
             if self.mpv_player.eof_reached:
                 self._handle_eof_detection()
@@ -385,19 +419,29 @@ class StreamWidget(QFrame):
             current_pos = self.mpv_player.time_pos
             is_paused = self.mpv_player.pause
             core_idle = self.mpv_player.core_idle
+            idle_active = getattr(self.mpv_player, 'idle_active', False)
         except: return
 
         if current_pos is None:
-            if core_idle: self.startup_wait_count += 1
-            else: self.startup_wait_count = 0
-            if self.startup_wait_count > 20: self._trigger_retry_logic()
+            # 如果還在載入中 (core_idle 或 idle_active 為 True 表示尚未有數據流)
+            if core_idle or idle_active: 
+                self.startup_wait_count += 1
+            else: 
+                self.startup_wait_count = 0
+            
+            if self.startup_wait_count > startup_threshold:
+                logging.warning(f"Watchdog: Startup timeout reached for {self.original_stream_url} (Count: {self.startup_wait_count})")
+                self._trigger_retry_logic()
             return
 
         self.startup_wait_count = 0
         
         if current_pos == self.last_time_pos and not is_paused:
             self.consecutive_stuck_count += 1
-            if self.consecutive_stuck_count > 12: self._trigger_retry_logic()
+            # 增加寬限期，避免網絡短暫波動導致重啟
+            if self.consecutive_stuck_count > 15: 
+                logging.warning(f"Watchdog: Playback stuck at {current_pos} for {self.original_stream_url}")
+                self._trigger_retry_logic()
         else:
             if self.consecutive_stuck_count > 0: self.status_label.setText("直播中")
             self.consecutive_stuck_count = 0
@@ -410,11 +454,14 @@ class StreamWidget(QFrame):
     def _trigger_retry_logic(self):
         if self.is_switching_stream: return
         
+        # 增加判斷閾值至 60 秒，以應對 YouTube 較慢的啟動過程
         session_duration = time.time() - self.play_start_time
-        if session_duration < 20 and self.play_start_time > 0:
+        if session_duration < 60 and self.play_start_time > 0:
             self.short_session_count += 1
+            logging.info(f"Short session detected ({session_duration:.1f}s). Count: {self.short_session_count}/5")
         
         if self.short_session_count >= 5:
+            logging.info(f"Too many short sessions for {self.original_stream_url}, stopping.")
             self._show_end_screen()
             return
         
@@ -427,7 +474,8 @@ class StreamWidget(QFrame):
             force_reinit = (self.retry_count > 1)
             QTimer.singleShot(1000, lambda: self._start_stream_loading(self._get_current_quality_code(), force_reinit=force_reinit))
         else:
-            self._handle_eof_detection()
+            logging.info(f"Max retries ({self.max_retries}) reached for {self.original_stream_url}")
+            self._show_end_screen()
 
     def force_reload_stream(self):
         self._manual_reload()
@@ -442,10 +490,19 @@ class StreamWidget(QFrame):
 
     def _handle_eof_detection(self):
         if self.is_closing or self.is_switching_stream: return
+        
         live_duration = time.time() - self.play_start_time
-        if live_duration < 5 and self.play_start_time > 0:
+        # 如果播放時間極短，直接進重試邏輯（會增加 short_session_count）
+        if live_duration < 10 and self.play_start_time > 0:
              self._trigger_retry_logic()
              return
+             
+        # 若是正常播放後結束，嘗試重連，但也要增加 retry_count 避免無限循環
+        self.retry_count += 1
+        if self.retry_count > 20: # 給予正常結束較寬鬆的重試機會
+            self._show_end_screen()
+            return
+
         self.status_label.setText("確認直播狀態...")
         QTimer.singleShot(2000, lambda: self._start_stream_loading(self._get_current_quality_code()))
 
