@@ -8,6 +8,7 @@ import time
 import re
 import ctypes
 import unicodedata
+import requests
 from urllib.parse import unquote, urlparse
 
 # ---------------------------------------------------------
@@ -48,7 +49,13 @@ from stream_widget import StreamWidget
 from cookie_manager import CookieManager
 
 log_path = os.path.join(data_dir, "debug.log")
-logging.basicConfig(filename=log_path, filemode='w', level=logging.INFO, encoding='utf-8')
+logging.basicConfig(
+    filename=log_path, 
+    filemode='a', 
+    level=logging.DEBUG, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
 
 # --- 樣式表區域 ---
 LIGHT_STYLE = """
@@ -111,16 +118,16 @@ class HelpWindow(QDialog):
         self.text_browser = QTextBrowser()
         self.text_browser.setOpenExternalLinks(True)
         
-        readme_path = os.path.join(internal_path, "README.md")
+        manual_path = os.path.join(internal_path, "MANUAL.md")
         content = ""
-        if os.path.exists(readme_path):
+        if os.path.exists(manual_path):
             try:
-                with open(readme_path, 'r', encoding='utf-8') as f:
+                with open(manual_path, 'r', encoding='utf-8') as f:
                     content = f.read()
             except Exception as e:
                 content = f"# 錯誤\n無法讀取說明檔: {e}"
         else:
-            content = "# VibeCoding Multi-Stream Viewer\n\n說明檔 (README.md) 遺失。"
+            content = "# VibeCoding Multi-Stream Viewer\n\n說明檔 (MANUAL.md) 遺失。"
             
         self.text_browser.setMarkdown(content)
         self.text_browser.setStyleSheet("font-size: 28px;")
@@ -138,6 +145,21 @@ class 狀態檢查器(QThread):
         self.items = items
         self.is_running = True
 
+    # [新增] YT 專屬的輕量化檢查，避開 streamlink 的重度 API 請求
+    def _check_yt_fast(self, url):
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9"
+            }
+            res = requests.get(url, headers=headers, timeout=5)
+            # 如果是直播中，YT 回傳的原始碼會包含這個特徵
+            if '"isLiveNow":true' in res.text or 'hqdefault_live.jpg' in res.text:
+                return True
+            return False
+        except:
+            return False
+
     def run(self):
         session = streamlink.Streamlink()
         if getattr(sys, 'frozen', False):
@@ -149,10 +171,10 @@ class 狀態檢查器(QThread):
         if os.path.exists(ffmpeg_path):
             session.set_option("ffmpeg-ffmpeg", ffmpeg_path)
         
-        headers = {
+        default_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         }
-        session.set_option("http-headers", headers)
+        session.set_option("http-headers", default_headers)
 
         cookies = CookieManager.get_cookies_for_streamlink()
         if cookies: 
@@ -167,11 +189,20 @@ class 狀態檢查器(QThread):
             url = item.get('url', '')
             if not url: continue
             
+            # [關鍵分流] 如果是 YT，走輕量化檢查通道
+            if "youtube.com" in url or "youtu.be" in url:
+                is_live = self._check_yt_fast(url)
+                self.status_updated.emit(i, is_live)
+                time.sleep(0.3) # 輕微延遲即可
+                continue
+
+            # ----- 以下為非 YT (Twitch/SOOP) 的常規檢查邏輯 -----
+            current_headers = default_headers.copy()
             if "sooplive" in url or "afreecatv" in url:
-                session.set_option("http-headers", {
-                    "Referer": "https://www.sooplive.co.kr/",
-                    "Origin": "https://www.sooplive.co.kr"
-                })
+                current_headers["Referer"] = "https://www.sooplive.co.kr/"
+                current_headers["Origin"] = "https://www.sooplive.co.kr"
+
+            session.set_option("http-headers", current_headers)
 
             try:
                 streams = session.streams(url)
@@ -179,7 +210,7 @@ class 狀態檢查器(QThread):
             except:
                 self.status_updated.emit(i, False)
             
-            time.sleep(1.0)
+            time.sleep(1.0) # SOOP/Twitch 仍需維持較長延遲避免被鎖
 
     def stop(self): 
         self.is_running = False
@@ -205,6 +236,7 @@ class 主視窗(QMainWindow):
         self.current_group_filter = "All"
         self.cached_fav_data = [] 
         self.is_closing_app = False # [Fix] 防止關閉時UI刷新衝突
+        self.is_batch_loading = False # [Issue 2] 批次載入標記
 
         # [V3.9.3] 直播狀態緩存
         self.live_status_cache = {} 
@@ -576,7 +608,12 @@ class 主視窗(QMainWindow):
         self.group_combo.blockSignals(False)
 
     def _當群組過濾變更時(self, text):
+        # [Expert-Refinement]: 切換群組時立即停止背景檢查，避免舊資料干擾新視圖
+        if self.checker_thread and self.checker_thread.isRunning():
+            self.checker_thread.stop()
+            
         self.current_group_filter = text
+        # 切換群組時不自動觸發檢查，讓使用者決定何時重新整理
         self._渲染收藏列表(check_status=False)
 
     def _檢測是否播放中(self, url):
@@ -591,7 +628,8 @@ class 主視窗(QMainWindow):
     def _渲染收藏列表(self, check_status=True):
             if self.is_closing_app: return # [Fix] 關閉中不渲染
 
-            self.fav_list.clear()
+            # [Expert-Fix]: 先收集所有項目，以便在渲染前根據排序規則進行預排序，避免批次載入時順序亂掉
+            display_items = []
             
             bold_font = QFont()
             bold_font.setBold(True)
@@ -606,7 +644,6 @@ class 主視窗(QMainWindow):
                 if self.current_group_filter == "All" or group == self.current_group_filter:
                     display_name = fav['name']
                     is_playing = self._檢測是否播放中(url)
-                    
                     is_live = self.live_status_cache.get(url, False)
 
                     display_text = ""
@@ -646,8 +683,22 @@ class 主視窗(QMainWindow):
                     
                     item.setFont(font)
                     item.setForeground(fore_color)
-                    
-                    self.fav_list.addItem(item)
+                    display_items.append(item)
+
+            # 根據自動排序設定進行預排序
+            if self.cb_auto_sort.isChecked():
+                if self.is_batch_loading:
+                    # [Issue 2 擴充]: 批次載入中，將「直播中(1)」與「播放中(2)」視為同級 (均 > 0)
+                    # 這樣能確保有開台的都在上面，但不會因為狀態從 1 變 2 而導致彼此位置互換（避免跳動）
+                    display_items.sort(key=lambda x: (1 if x.data(Qt.UserRole + 3) > 0 else 0), reverse=True)
+                else:
+                    # 平時：完整排序 (播放中 > 直播中 > 離線)
+                    display_items.sort(key=lambda x: x.data(Qt.UserRole + 3), reverse=True)
+
+            # 正式渲染到 UI
+            self.fav_list.clear()
+            for item in display_items:
+                self.fav_list.addItem(item)
             
             if check_status:
                 self._檢查直播狀態()
@@ -771,7 +822,8 @@ class 主視窗(QMainWindow):
                 new_player.request_removal.connect(self._移除串流)
                 new_player.fullscreen_toggled.connect(self._當全螢幕切換時)
                 new_player.clicked.connect(self._當播放器被點擊_左對右)
-                new_player.playing_state_changed.connect(self._當播放狀態改變時)
+                # [Issue 3] 傳遞播放器物件以利識別
+                new_player.playing_state_changed.connect(lambda is_playing, p=new_player: self._當播放狀態改變時(is_playing, p))
                 
                 self.訊號_廣播音量.connect(new_player.set_volume_slot)
                 
@@ -790,10 +842,19 @@ class 主視窗(QMainWindow):
                     self.cached_fav_data.pop()
                     self._渲染收藏列表(check_status=False)
     
-    def _當播放狀態改變時(self, is_playing):
+    def _當播放狀態改變時(self, is_playing, player=None):
         if self.is_closing_app: return
+        
+        # [Issue 3] 如果直播結束，立即將快取狀態設為離線 (燈號變黑)
+        if not is_playing and player and player.is_stream_ended:
+            url = player.original_stream_url
+            self.live_status_cache[url] = False
+            logging.info(f"Stream ended for {url}, forcing lamp to black.")
+
         self._渲染收藏列表(check_status=False)
-        if self.cb_auto_sort.isChecked():
+        
+        # [Issue 2] 只有在非批次載入時才觸發自動排序，避免跳動
+        if not self.is_batch_loading and self.cb_auto_sort.isChecked():
             self._自動排序收藏()
 
     def _當播放器被點擊_左對右(self, target_player):
@@ -1031,6 +1092,9 @@ class 主視窗(QMainWindow):
     def _處理下一個載入請求(self):
         if not self.load_queue:
             self.loading_batch_count = 0 
+            self.is_batch_loading = False # [Issue 2] 載入完畢，恢復自動排序
+            if self.cb_auto_sort.isChecked():
+                self._自動排序收藏()
             return
         
         url = self.load_queue.pop(0)
@@ -1052,6 +1116,7 @@ class 主視窗(QMainWindow):
     def _載入當前群組串流(self):
         self.load_queue.clear()
         self.loading_batch_count = 0
+        self.is_batch_loading = True # [Issue 2] 開始批次載入
         count = 0
         for i in range(self.fav_list.count()):
             item = self.fav_list.item(i)
@@ -1059,6 +1124,7 @@ class 主視窗(QMainWindow):
             count += 1
         
         if count == 0:
+            self.is_batch_loading = False
             QMessageBox.information(self, "提示", "當前列表無頻道")
         else:
             self._處理下一個載入請求() 
@@ -1170,6 +1236,7 @@ class 主視窗(QMainWindow):
     def _開啟選取的收藏(self):
         self.load_queue.clear()
         self.loading_batch_count = 0
+        self.is_batch_loading = True # [Issue 2]
         items = self._取得勾選項目()
         for item in items:
             self.load_queue.append(item.data(Qt.UserRole))
@@ -1177,17 +1244,22 @@ class 主視窗(QMainWindow):
         
         if self.load_queue:
             self._處理下一個載入請求()
+        else:
+            self.is_batch_loading = False
 
     def _開啟直播中收藏(self):
         self.load_queue.clear()
         self.loading_batch_count = 0
+        self.is_batch_loading = True # [Issue 2]
         count = 0
         for i in range(self.fav_list.count()):
             item = self.fav_list.item(i)
             if item.data(Qt.UserRole + 3) == 1:
                 self.load_queue.append(item.data(Qt.UserRole))
                 count += 1
-        if count == 0: QMessageBox.information(self, "提示", "無直播中頻道")
+        if count == 0: 
+            self.is_batch_loading = False
+            QMessageBox.information(self, "提示", "無直播中頻道")
         else: self._處理下一個載入請求()
 
     def _匯出收藏(self):
@@ -1285,10 +1357,12 @@ class 主視窗(QMainWindow):
     # [Fix] 關閉程式時強制結束所有執行緒
     def closeEvent(self, event):
         self.is_closing_app = True # 鎖定UI
+        if self.checker_thread:
+            self.checker_thread.stop()
         self._清空所有串流()
         super().closeEvent(event)
-        # 強制自殺，防止背景執行緒卡死黑窗
-        QTimer.singleShot(100, lambda: sys.exit(0))
+        # [Expert-Refinement]: 給予 CleanupThread 更多時間完成 subprocess 清理
+        QTimer.singleShot(300, lambda: sys.exit(0))
 
 def main():
     os.environ["QT_FONT_DPI"] = "96"
@@ -1311,6 +1385,16 @@ def main():
         
     window.show()
     sys.exit(app.exec())
+
+def global_exception_handler(exctype, value, tb):
+    """捕獲所有未處理的異常並寫入日誌"""
+    import traceback
+    error_msg = "".join(traceback.format_exception(exctype, value, tb))
+    logging.critical(f"系統崩潰 (Unhandled Exception):\n{error_msg}")
+    # 同時彈出對話框警告（如果 UI 還活著）
+    sys.__excepthook__(exctype, value, tb)
+
+sys.excepthook = global_exception_handler
 
 if __name__ == "__main__":
     main()
